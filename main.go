@@ -2,20 +2,25 @@ package main
 
 import (
     "context"
+    "encoding/json"
     "fmt"
     "log"
     "os"
 
+    "github.com/akhidasTech/github-agentic-chat-mcp/pkg/vectorstore"
     "github.com/google/go-github/v57/github"
     "github.com/mark3labs/mcp-go/mcp"
     "github.com/mark3labs/mcp-go/server"
     "golang.org/x/oauth2"
 )
 
-var githubClient *github.Client
+var (
+    githubClient *github.Client
+    vectorStore  *vectorstore.VectorStore
+)
 
 func init() {
-    // Initialize GitHub client with token
+    // Initialize GitHub client
     token := os.Getenv("GITHUB_TOKEN")
     if token == "" {
         log.Fatal("GITHUB_TOKEN environment variable is required")
@@ -26,6 +31,23 @@ func init() {
     )
     tc := oauth2.NewClient(context.Background(), ts)
     githubClient = github.NewClient(tc)
+
+    // Initialize vector store
+    dbURL := os.Getenv("DATABASE_URL")
+    if dbURL == "" {
+        log.Fatal("DATABASE_URL environment variable is required")
+    }
+
+    openaiKey := os.Getenv("OPENAI_API_KEY")
+    if openaiKey == "" {
+        log.Fatal("OPENAI_API_KEY environment variable is required")
+    }
+
+    var err error
+    vectorStore, err = vectorstore.NewVectorStore(dbURL, openaiKey)
+    if err != nil {
+        log.Fatalf("Failed to initialize vector store: %v", err)
+    }
 }
 
 func main() {
@@ -37,7 +59,34 @@ func main() {
         server.WithLogging(),
     )
 
-    // Add search repositories tool
+    // Add vector search tools
+    addVectorSearchTool := mcp.NewTool("add_to_vector_store",
+        mcp.WithDescription("Add a document to the vector store"),
+        mcp.WithString("content",
+            mcp.Required(),
+            mcp.Description("The content to store"),
+        ),
+        mcp.WithString("metadata",
+            mcp.Required(),
+            mcp.Description("JSON string of metadata"),
+        ),
+    )
+    s.AddTool(addVectorSearchTool, handleAddToVectorStore)
+
+    searchVectorTool := mcp.NewTool("vector_search",
+        mcp.WithDescription("Search the vector store"),
+        mcp.WithString("query",
+            mcp.Required(),
+            mcp.Description("The search query"),
+        ),
+        mcp.WithNumber("limit",
+            mcp.Description("Maximum number of results"),
+            mcp.Default(5),
+        ),
+    )
+    s.AddTool(searchVectorTool, handleVectorSearch)
+
+    // Add GitHub tools
     searchReposTool := mcp.NewTool("search_repositories",
         mcp.WithDescription("Search GitHub repositories"),
         mcp.WithString("query",
@@ -47,7 +96,6 @@ func main() {
     )
     s.AddTool(searchReposTool, handleSearchRepositories)
 
-    // Add create issue tool
     createIssueTool := mcp.NewTool("create_issue",
         mcp.WithDescription("Create a new issue in a repository"),
         mcp.WithString("owner",
@@ -75,6 +123,39 @@ func main() {
     }
 }
 
+func handleAddToVectorStore(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    content := request.Params.Arguments["content"].(string)
+    metadataStr := request.Params.Arguments["metadata"].(string)
+
+    var metadata map[string]interface{}
+    if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
+        return mcp.NewToolResultError(fmt.Sprintf("Invalid metadata JSON: %v", err)), nil
+    }
+
+    if err := vectorStore.AddDocument(ctx, content, metadata); err != nil {
+        return mcp.NewToolResultError(fmt.Sprintf("Failed to add document: %v", err)), nil
+    }
+
+    return mcp.NewToolResultText("Document added successfully"), nil
+}
+
+func handleVectorSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+    query := request.Params.Arguments["query"].(string)
+    limit := int(request.Params.Arguments["limit"].(float64))
+
+    docs, err := vectorStore.Search(ctx, query, limit)
+    if err != nil {
+        return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+    }
+
+    var results []string
+    for _, doc := range docs {
+        results = append(results, fmt.Sprintf("Content: %s\nMetadata: %s\n---", doc.Content, doc.Metadata))
+    }
+
+    return mcp.NewToolResultText(fmt.Sprintf("Found %d documents:\n\n%s", len(docs), results)), nil
+}
+
 func handleSearchRepositories(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
     query := request.Params.Arguments["query"].(string)
     
@@ -94,7 +175,7 @@ func handleSearchRepositories(ctx context.Context, request mcp.CallToolRequest) 
         repoList = append(repoList, fmt.Sprintf("%s/%s: %s", *repo.Owner.Login, *repo.Name, *repo.Description))
     }
 
-    return mcp.NewToolResultText(fmt.Sprintf("Found repositories:\n%s", repoList)), nil
+    return mcp.NewToolResultText(fmt.Sprintf("Found repositories:\n%v", repoList)), nil
 }
 
 func handleCreateIssue(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
